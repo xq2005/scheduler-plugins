@@ -26,32 +26,53 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/wait"
 	corelisters "k8s.io/client-go/listers/core/v1"
-	"k8s.io/klog"
-	"k8s.io/kubernetes/pkg/api/v1/pod"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
+	podutil "k8s.io/kubernetes/pkg/api/v1/pod"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
+	"k8s.io/kubernetes/pkg/scheduler/util"
+	config "sigs.k8s.io/scheduler-plugins/pkg/apis/config"
 )
 
 // Coscheduling is a plugin that implements the mechanism of gang scheduling.
 type Coscheduling struct {
 	frameworkHandle framework.FrameworkHandle
 	podLister       corelisters.PodLister
-	// Key is the name of Namespace/PodGroup.
+	// key is <namespace>/<PodGroup name> and value is *PodGroupInfo.
 	podGroupInfos sync.Map
+	// clock is used to get the current time.
+	clock util.Clock
+	// args is coscheduling parameters
+	args config.CoschedulingArgs
 }
 
 // PodGroupInfo is a wrapper to a PodGroup with additional information.
-// TODO implement a timeout based gc for the PodGroupInfos map
+// A PodGroup's priority, timestamp and minAvailable are set according to
+// the values of the PodGroup's first pod that is added to the scheduling queue.
 type PodGroupInfo struct {
+	// key is a unique PodGroup ID and currently implemented as <namespace>/<PodGroup name>.
+	key string
+	// name is the PodGroup name and defined through a Pod label.
+	// The PodGroup name of a regular pod is empty.
 	name string
-	// timestamp stores the timestamp of the initialization time of PodGroup.
+	// priority is the priority of pods in a PodGroup.
+	// All pods in a PodGroup should have the same priority.
+	priority int32
+	// timestamp stores the initialization timestamp of a PodGroup.
 	timestamp time.Time
+	// minAvailable is the minimum number of pods to be co-scheduled in a PodGroup.
+	// All pods in a PodGroup should have the same minAvailable.
+	minAvailable int
+	// deletionTimestamp stores the timestamp when the PodGroup marked as expired.
+	deletionTimestamp *time.Time
 }
 
 var _ framework.QueueSortPlugin = &Coscheduling{}
 var _ framework.PreFilterPlugin = &Coscheduling{}
 var _ framework.PermitPlugin = &Coscheduling{}
-var _ framework.UnreservePlugin = &Coscheduling{}
+var _ framework.ReservePlugin = &Coscheduling{}
 
 const (
 	// Name is the name of the plugin used in Registry and configurations.
@@ -60,9 +81,6 @@ const (
 	PodGroupName = "pod-group.scheduling.sigs.k8s.io/name"
 	// PodGroupMinAvailable specifies the minimum number of pods to be scheduled together in a pod group.
 	PodGroupMinAvailable = "pod-group.scheduling.sigs.k8s.io/min-available"
-	// PermitWaitingTime is the wait timeout returned by Permit plugin
-	// TODO make it configurable
-	PermitWaitingTime = 1 * time.Second
 )
 
 // Name returns name of the plugin. It is used in logs, etc.
@@ -71,29 +89,59 @@ func (cs *Coscheduling) Name() string {
 }
 
 // New initializes a new plugin and returns it.
-func New(_ *runtime.Unknown, handle framework.FrameworkHandle) (framework.Plugin, error) {
+func New(obj runtime.Object, handle framework.FrameworkHandle) (framework.Plugin, error) {
+	args, ok := obj.(*config.CoschedulingArgs)
+	if !ok {
+		return nil, fmt.Errorf("want args to be of type CoschedulingArgs, got %T", obj)
+	}
+
 	podLister := handle.SharedInformerFactory().Core().V1().Pods().Lister()
-	return &Coscheduling{frameworkHandle: handle,
+	cs := &Coscheduling{frameworkHandle: handle,
 		podLister: podLister,
-	}, nil
+		clock:     util.RealClock{},
+		args:      *args,
+	}
+	podInformer := handle.SharedInformerFactory().Core().V1().Pods().Informer()
+	podInformer.AddEventHandler(
+		cache.FilteringResourceEventHandler{
+			FilterFunc: func(obj interface{}) bool {
+				switch t := obj.(type) {
+				case *v1.Pod:
+					return responsibleForPod(t)
+				case cache.DeletedFinalStateUnknown:
+					if pod, ok := t.Obj.(*v1.Pod); ok {
+						return responsibleForPod(pod)
+					}
+					return false
+				default:
+					return false
+				}
+			},
+			Handler: cache.ResourceEventHandlerFuncs{
+				DeleteFunc: cs.markPodGroupAsExpired,
+			},
+		},
+	)
+	go wait.Until(cs.podGroupInfoGC, time.Duration(*cs.args.PodGroupGCIntervalSeconds)*time.Second, nil)
+
+	return cs, nil
 }
 
-// Less are used to sort pods in the scheduling queue.
-// 1. Compare the priorities of pods.
-// 2. Compare the timestamps of the initialization time of PodGroups.
-// 3. Compare the keys of PodGroups.
-func (cs *Coscheduling) Less(podInfo1 *framework.PodInfo, podInfo2 *framework.PodInfo) bool {
-	pod1 := podInfo1.Pod
-	pod2 := podInfo2.Pod
-	priority1 := pod.GetPodPriority(pod1)
-	priority2 := pod.GetPodPriority(pod2)
+// Less is used to sort pods in the scheduling queue.
+// 1. Compare the priorities of Pods.
+// 2. Compare the initialization timestamps of PodGroups/Pods.
+// 3. Compare the keys of PodGroups/Pods, i.e., if two pods are tied at priority and creation time, the one without podGroup will go ahead of the one with podGroup.
+func (cs *Coscheduling) Less(podInfo1, podInfo2 *framework.QueuedPodInfo) bool {
+	pgInfo1, _ := cs.getOrCreatePodGroupInfo(podInfo1.Pod, podInfo1.InitialAttemptTimestamp)
+	pgInfo2, _ := cs.getOrCreatePodGroupInfo(podInfo2.Pod, podInfo2.InitialAttemptTimestamp)
+
+	priority1 := pgInfo1.priority
+	priority2 := pgInfo2.priority
 
 	if priority1 != priority2 {
 		return priority1 > priority2
 	}
 
-	pgInfo1 := cs.getPodGroupInfo(podInfo1)
-	pgInfo2 := cs.getPodGroupInfo(podInfo2)
 	time1 := pgInfo1.timestamp
 	time2 := pgInfo2.timestamp
 
@@ -101,83 +149,119 @@ func (cs *Coscheduling) Less(podInfo1 *framework.PodInfo, podInfo2 *framework.Po
 		return time1.Before(time2)
 	}
 
-	key1 := fmt.Sprintf("%v/%v", podInfo1.Pod.Namespace, pgInfo1.name)
-	key2 := fmt.Sprintf("%v/%v", podInfo2.Pod.Namespace, pgInfo2.name)
-	return key1 < key2
+	return pgInfo1.key < pgInfo2.key
 }
 
-func (cs *Coscheduling) getPodGroupInfo(p *framework.PodInfo) *PodGroupInfo {
-	podGroupName, min, err := GetPodGroupLabels(p.Pod)
-	if err == nil && podGroupName != "" && min > 1 {
-		key := fmt.Sprintf("%v/%v", p.Pod.Namespace, podGroupName)
-		pgInfo, ok := cs.podGroupInfos.Load(key)
-		if !ok {
-			pgInfo = &PodGroupInfo{
-				name:      podGroupName,
-				timestamp: p.InitialAttemptTimestamp,
+// getOrCreatePodGroupInfo returns the existing PodGroup in PodGroupInfos if present.
+// Otherwise, it creates a PodGroup and returns the value, It stores
+// the created PodGroup in PodGroupInfo if the pod defines a  PodGroup and its
+// PodGroupMinAvailable is greater than one. It also returns the pod's
+// PodGroupMinAvailable (0 if not specified).
+func (cs *Coscheduling) getOrCreatePodGroupInfo(pod *v1.Pod, ts time.Time) (*PodGroupInfo, int) {
+	podGroupName, podMinAvailable, _ := GetPodGroupLabels(pod)
+
+	var pgKey string
+	if len(podGroupName) > 0 && podMinAvailable > 0 {
+		pgKey = fmt.Sprintf("%v/%v", pod.Namespace, podGroupName)
+	}
+
+	// If it is a PodGroup and present in PodGroupInfos, return it.
+	if len(pgKey) != 0 {
+		value, exist := cs.podGroupInfos.Load(pgKey)
+		if exist {
+			pgInfo := value.(*PodGroupInfo)
+			// If the deleteTimestamp isn't nil, it means that the PodGroup is marked as expired before.
+			// So we need to set the deleteTimestamp as nil again to mark the PodGroup active.
+			if pgInfo.deletionTimestamp != nil {
+				pgInfo.deletionTimestamp = nil
+				cs.podGroupInfos.Store(pgKey, pgInfo)
 			}
-			cs.podGroupInfos.Store(key, pgInfo)
+			return pgInfo, podMinAvailable
 		}
-		return pgInfo.(*PodGroupInfo)
 	}
 
-	// If the pod is regular pod, return object of PodGroupInfo but not store in PodGroupInfos.
-	// The purpose is to facilitate unified comparison.
-	return &PodGroupInfo{name: "", timestamp: p.InitialAttemptTimestamp}
+	// If the PodGroup is not present in PodGroupInfos or the pod is a regular pod,
+	// create a PodGroup for the Pod and store it in PodGroupInfos if it's not a regular pod.
+	pgInfo := &PodGroupInfo{
+		name:         podGroupName,
+		key:          pgKey,
+		priority:     podutil.GetPodPriority(pod),
+		timestamp:    ts,
+		minAvailable: podMinAvailable,
+	}
+
+	// If it's not a regular Pod, store the PodGroup in PodGroupInfos
+	if len(pgKey) > 0 {
+		cs.podGroupInfos.Store(pgKey, pgInfo)
+	}
+	return pgInfo, podMinAvailable
 }
 
-// PreFilter validates that if the total number of pods belonging to the same `PodGroup` is less than `minAvailable`.
-// If so, the scheduling process will be interrupted directly to avoid the partial Pods holding system resources
-// until a timeout. It will reduce the overall scheduling time for the whole group
-func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleState, p *v1.Pod) *framework.Status {
-	podGroupName, minAvailable, err := GetPodGroupLabels(p)
-	if err != nil {
-		return framework.NewStatus(framework.Error, err.Error())
-	}
-	if podGroupName == "" || minAvailable <= 1 {
+// PreFilter performs the following validations.
+// 1. Validate if minAvailables and priorities of all the pods in a PodGroup are the same.
+// 2. Validate if the total number of pods belonging to the same `PodGroup` is less than `minAvailable`.
+//    If so, the scheduling process will be interrupted directly to avoid the partial Pods and hold the system resources
+//    until a timeout. It will reduce the overall scheduling time for the whole group.
+func (cs *Coscheduling) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) *framework.Status {
+	pgInfo, podMinAvailable := cs.getOrCreatePodGroupInfo(pod, time.Now())
+	pgKey := pgInfo.key
+	if len(pgKey) == 0 {
 		return framework.NewStatus(framework.Success, "")
 	}
+	pgMinAvailable := pgInfo.minAvailable
 
-	total := cs.calculateTotalPods(podGroupName, p.Namespace)
-	if total < minAvailable {
-		klog.V(3).Infof("The count of podGroup %v/%v/%v is not up to minAvailable(%d) in PreFilter: %d",
-			p.Namespace, podGroupName, p.Name, minAvailable, total)
-		return framework.NewStatus(framework.Unschedulable, "less than minAvailable")
+	// Check if the values of minAvailable are the same.
+	if podMinAvailable != pgMinAvailable {
+		klog.V(3).Infof("Pod %v has a different minAvailable (%v) as the PodGroup %v (%v)", pod.Name, podMinAvailable, pgKey, pgMinAvailable)
+		return framework.NewStatus(framework.Unschedulable, "PodGroupMinAvailables do not match")
+	}
+	// Check if the priorities are the same.
+	pgPriority := pgInfo.priority
+	podPriority := podutil.GetPodPriority(pod)
+	if pgPriority != podPriority {
+		klog.V(3).Infof("Pod %v has a different priority (%v) as the PodGroup %v (%v)", pod.Name, podPriority, pgKey, pgPriority)
+		return framework.NewStatus(framework.Unschedulable, "Priorities do not match")
+	}
+
+	total := cs.calculateTotalPods(pgInfo.name, pod.Namespace)
+	if total < pgMinAvailable {
+		klog.V(3).Infof("The count of PodGroup %v (%v) is less than minAvailable(%d) in PreFilter: %d",
+			pgKey, pod.Name, pgMinAvailable, total)
+		return framework.NewStatus(framework.Unschedulable, "less than pgMinAvailable")
 	}
 
 	return framework.NewStatus(framework.Success, "")
 }
 
-// PreFilterExtensions returns nil
+// PreFilterExtensions returns nil.
 func (cs *Coscheduling) PreFilterExtensions() framework.PreFilterExtensions {
 	return nil
 }
 
-// Permit is the functions invoked by the framework at "permit" extension point.
-func (cs *Coscheduling) Permit(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) (*framework.Status, time.Duration) {
-	podGroupName, minAvailable, err := GetPodGroupLabels(p)
-	if err != nil {
-		return framework.NewStatus(framework.Error, err.Error()), 0
-	}
-	if podGroupName == "" || minAvailable <= 1 {
+// Permit is the functions invoked by the framework at "Permit" extension point.
+func (cs *Coscheduling) Permit(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (*framework.Status, time.Duration) {
+	pgInfo, _ := cs.getOrCreatePodGroupInfo(pod, time.Now())
+	if len(pgInfo.key) == 0 {
 		return framework.NewStatus(framework.Success, ""), 0
 	}
 
-	namespace := p.Namespace
-	// TODO get actually scheduled(bind successfully) account from the SharedLister
-	running := cs.calculateRunningPods(podGroupName, namespace)
-	waiting := cs.calculateWaitingPods(podGroupName, namespace)
-	current := running + waiting + 1
+	namespace := pod.Namespace
+	podGroupName := pgInfo.name
+	minAvailable := pgInfo.minAvailable
+	// bound includes both assigned and assumed Pods.
+	bound := cs.calculateBoundPods(podGroupName, namespace)
+	// The bound is calculated from the snapshot. The current pod does not exist in the snapshot during this scheduling cycle.
+	current := bound + 1
 
 	if current < minAvailable {
-		klog.V(3).Infof("The count of podGroup %v/%v/%v is not up to minAvailable(%d) in Permit: running(%d), waiting(%d)",
-			p.Namespace, podGroupName, p.Name, minAvailable, running, waiting)
+		klog.V(3).Infof("The count of podGroup %v/%v/%v is not up to minAvailable(%d) in Permit: current(%d)",
+			pod.Namespace, podGroupName, pod.Name, minAvailable, current)
 		// TODO Change the timeout to a dynamic value depending on the size of the `PodGroup`
-		return framework.NewStatus(framework.Wait, ""), 10 * PermitWaitingTime
+		return framework.NewStatus(framework.Wait, ""), time.Duration(*cs.args.PermitWaitingTimeSeconds) * time.Second
 	}
 
-	klog.V(3).Infof("The count of podGroup %v/%v/%v is up to minAvailable(%d) in Permit: running(%d), waiting(%d)",
-		p.Namespace, podGroupName, p.Name, minAvailable, running, waiting)
+	klog.V(3).Infof("The count of PodGroup %v/%v/%v is up to minAvailable(%d) in Permit: current(%d)",
+		pod.Namespace, podGroupName, pod.Name, minAvailable, current)
 	cs.frameworkHandle.IterateOverWaitingPods(func(waitingPod framework.WaitingPod) {
 		if waitingPod.GetPod().Namespace == namespace && waitingPod.GetPod().Labels[PodGroupName] == podGroupName {
 			klog.V(3).Infof("Permit allows the pod: %v/%v", podGroupName, waitingPod.GetPod().Name)
@@ -188,42 +272,50 @@ func (cs *Coscheduling) Permit(ctx context.Context, state *framework.CycleState,
 	return framework.NewStatus(framework.Success, ""), 0
 }
 
+func (cs *Coscheduling) Reserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) *framework.Status {
+	return nil
+}
+
 // Unreserve rejects all other Pods in the PodGroup when one of the pods in the group times out.
-func (cs *Coscheduling) Unreserve(ctx context.Context, state *framework.CycleState, p *v1.Pod, nodeName string) {
-	podGroupName, exist := p.Labels[PodGroupName]
-	if !exist {
+func (cs *Coscheduling) Unreserve(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) {
+	pgInfo, _ := cs.getOrCreatePodGroupInfo(pod, time.Now())
+	if len(pgInfo.key) == 0 {
 		return
 	}
-
+	podGroupName := pgInfo.name
 	cs.frameworkHandle.IterateOverWaitingPods(func(waitingPod framework.WaitingPod) {
-		if waitingPod.GetPod().Namespace == p.Namespace && waitingPod.GetPod().Labels[PodGroupName] == podGroupName {
+		if waitingPod.GetPod().Namespace == pod.Namespace && waitingPod.GetPod().Labels[PodGroupName] == podGroupName {
 			klog.V(3).Infof("Unreserve rejects the pod: %v/%v", podGroupName, waitingPod.GetPod().Name)
 			waitingPod.Reject(cs.Name())
 		}
 	})
 }
 
-// GetPodGroupLabels will check the pod if belongs to some podGroup. If so, it will return the
-// podGroupName、minAvailable of podGroup. If not, it will return "" as podGroupName.
-func GetPodGroupLabels(p *v1.Pod) (string, int, error) {
-	podGroupName, exist := p.Labels[PodGroupName]
-	if !exist || podGroupName == "" {
+// GetPodGroupLabels checks if the pod belongs to a PodGroup. If so, it will return the
+// podGroupName, minAvailable of the PodGroup. If not, it will return "" and 0.
+func GetPodGroupLabels(pod *v1.Pod) (string, int, error) {
+	podGroupName, exist := pod.Labels[PodGroupName]
+	if !exist || len(podGroupName) == 0 {
 		return "", 0, nil
 	}
-	minAvailable, exist := p.Labels[PodGroupMinAvailable]
-	if !exist || minAvailable == "" {
+	minAvailable, exist := pod.Labels[PodGroupMinAvailable]
+	if !exist || len(minAvailable) == 0 {
 		return "", 0, nil
 	}
 	minNum, err := strconv.Atoi(minAvailable)
 	if err != nil {
-		klog.Errorf("GetPodGroupLabels err in coschduling %v/%v : %v", p.Namespace, p.Name, err.Error())
+		klog.Errorf("PodGroup %v/%v : PodGroupMinAvailable %v is invalid", pod.Namespace, pod.Name, minAvailable)
+		return "", 0, err
+	}
+	if minNum < 1 {
+		klog.Errorf("PodGroup %v/%v : PodGroupMinAvailable %v is less than 1", pod.Namespace, pod.Name, minAvailable)
 		return "", 0, err
 	}
 	return podGroupName, minNum, nil
 }
 
 func (cs *Coscheduling) calculateTotalPods(podGroupName, namespace string) int {
-	// TODO get the total pods from the scheduler cache and queue instead of the hack manner
+	// TODO get the total pods from the scheduler cache and queue instead of the hack manner.
 	selector := labels.Set{PodGroupName: podGroupName}.AsSelector()
 	pods, err := cs.podLister.Pods(namespace).List(selector)
 	if err != nil {
@@ -233,31 +325,63 @@ func (cs *Coscheduling) calculateTotalPods(podGroupName, namespace string) int {
 	return len(pods)
 }
 
-func (cs *Coscheduling) calculateRunningPods(podGroupName, namespace string) int {
-	pods, err := cs.frameworkHandle.SnapshotSharedLister().Pods().FilteredList(func(pod *v1.Pod) bool {
-		if pod.Labels[PodGroupName] == podGroupName && pod.Namespace == namespace && pod.Status.Phase == v1.PodRunning {
-			return true
-		}
-		return false
-	}, labels.NewSelector())
-
+func (cs *Coscheduling) calculateBoundPods(podGroupName, namespace string) int {
+	nodeInfos, err := cs.frameworkHandle.SnapshotSharedLister().NodeInfos().List()
 	if err != nil {
-		klog.Error(err)
+		klog.Errorf("Cannot get nodeInfos from frameworkHandle: %v", err)
 		return 0
 	}
+	var count int
+	for _, nodeInfo := range nodeInfos {
+		for _, podInfo := range nodeInfo.Pods {
+			pod := podInfo.Pod
+			if pod.Labels[PodGroupName] == podGroupName && pod.Namespace == namespace && pod.Spec.NodeName != "" {
+				count++
+			}
+		}
+	}
 
-	return len(pods)
+	return count
 }
 
-func (cs *Coscheduling) calculateWaitingPods(podGroupName, namespace string) int {
-	waiting := 0
-	// Calculate the waiting pods.
-	// TODO keep a cache of podgroup size.
-	cs.frameworkHandle.IterateOverWaitingPods(func(waitingPod framework.WaitingPod) {
-		if waitingPod.GetPod().Labels[PodGroupName] == podGroupName && waitingPod.GetPod().Namespace == namespace {
-			waiting++
-		}
-	})
+// markPodGroupAsExpired set the deletionTimestamp of PodGroup to mark PodGroup as expired.
+func (cs *Coscheduling) markPodGroupAsExpired(obj interface{}) {
+	pod := obj.(*v1.Pod)
+	podGroupName, podMinAvailable, _ := GetPodGroupLabels(pod)
+	if len(podGroupName) == 0 || podMinAvailable == 0 {
+		return
+	}
 
-	return waiting
+	pgKey := fmt.Sprintf("%v/%v", pod.Namespace, podGroupName)
+	// If it's a PodGroup and present in PodGroupInfos, set its deletionTimestamp.
+	value, exist := cs.podGroupInfos.Load(pgKey)
+	if !exist {
+		return
+	}
+	pgInfo := value.(*PodGroupInfo)
+	if pgInfo.deletionTimestamp == nil {
+		now := cs.clock.Now()
+		pgInfo.deletionTimestamp = &now
+		cs.podGroupInfos.Store(pgKey, pgInfo)
+	}
+}
+
+// responsibleForPod selects pod that belongs to a PodGroup.
+func responsibleForPod(pod *v1.Pod) bool {
+	podGroupName, podMinAvailable, _ := GetPodGroupLabels(pod)
+	if len(podGroupName) == 0 || podMinAvailable == 0 {
+		return false
+	}
+	return true
+}
+
+func (cs *Coscheduling) podGroupInfoGC() {
+	cs.podGroupInfos.Range(func(key, value interface{}) bool {
+		pgInfo := value.(*PodGroupInfo)
+		if pgInfo.deletionTimestamp != nil && pgInfo.deletionTimestamp.Add(time.Duration(*cs.args.PodGroupExpirationTimeSeconds)*time.Second).Before(cs.clock.Now()) {
+			klog.V(3).Infof("%v is out of date and has been deleted in PodGroup GC", key)
+			cs.podGroupInfos.Delete(key)
+		}
+		return true
+	})
 }
