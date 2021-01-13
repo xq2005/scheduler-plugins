@@ -33,6 +33,7 @@ import (
 	kubeschedulerconfig "k8s.io/kubernetes/pkg/scheduler/apis/config"
 
 	"sigs.k8s.io/scheduler-plugins/pkg/coscheduling"
+	"sigs.k8s.io/scheduler-plugins/pkg/noderesources"
 	"sigs.k8s.io/scheduler-plugins/pkg/qos"
 )
 
@@ -46,8 +47,9 @@ func TestSetup(t *testing.T) {
 
 	// https server
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(200)
-		w.Write([]byte(`ok`))
+		w.Write([]byte(`{"metadata": {"name": "test"}}`))
 	}))
 	defer server.Close()
 
@@ -71,6 +73,36 @@ users:
   user:
     username: config
 `, server.URL)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// PodState plugin config
+	podStateConfigFile := filepath.Join(tmpDir, "podState.yaml")
+	if err := ioutil.WriteFile(podStateConfigFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    queueSort:
+      disabled:
+      - name: "*"
+    preFilter:
+      disabled:
+      - name: "*"
+    filter:
+      disabled:
+      - name: "*"
+    preScore:
+      disabled:
+      - name: "*"
+    score:
+      enabled:
+      - name: PodState
+      disabled:
+      - name: "*"
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -138,7 +170,15 @@ profiles:
     reserve:
       enabled:
       - name: Coscheduling
-`, configKubeconfig)), os.FileMode(0600)); err != nil {
+    postBind:
+      enabled:
+      - name: Coscheduling
+  pluginConfig:
+  - name: Coscheduling
+    args:
+      permitWaitingTimeSeconds: 10
+      kubeConfigPath: "%s"
+`, configKubeconfig, configKubeconfig)), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -176,11 +216,89 @@ profiles:
     reserve:
       enabled:
       - name: Coscheduling
+    postBind:
+      enabled:
+      - name: Coscheduling
   pluginConfig:
   - name: Coscheduling
     args:
-      permitWaitingTimeSeconds: 15
+      permitWaitingTimeSeconds: 10
+      kubeConfigPath: "%s"
+`, configKubeconfig, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// NodeResourcesAllocatable plugin config
+	nodeResourcesAllocatableConfigFile := filepath.Join(tmpDir, "nodeResourcesAllocatable.yaml")
+	if err := ioutil.WriteFile(nodeResourcesAllocatableConfigFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    score:
+      enabled:
+      - name: NodeResourcesAllocatable
+      disabled:
+      - name: "*"
 `, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// NodeResourcesAllocatable plugin config with arguments
+	nodeResourcesAllocatableConfigWithArgsFile := filepath.Join(tmpDir, "nodeResourcesAllocatable-with-args.yaml")
+	if err := ioutil.WriteFile(nodeResourcesAllocatableConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- plugins:
+    score:
+      enabled:
+      - name: NodeResourcesAllocatable
+      disabled:
+      - name: "*"
+  pluginConfig:
+  - name: NodeResourcesAllocatable
+    args:
+      mode: Least
+      resources:
+      - name: cpu
+        weight: 1000000
+      - name: memory
+        weight: 1
+`, configKubeconfig)), os.FileMode(0600)); err != nil {
+		t.Fatal(err)
+	}
+
+	// CapacityScheduling plugin config with arguments
+	capacitySchedulingConfigWithArgsFile := filepath.Join(tmpDir, "capacityScheduling-with-args.yaml")
+	if err := ioutil.WriteFile(capacitySchedulingConfigWithArgsFile, []byte(fmt.Sprintf(`
+apiVersion: kubescheduler.config.k8s.io/v1beta1
+kind: KubeSchedulerConfiguration
+clientConnection:
+  kubeconfig: "%s"
+profiles:
+- schedulerName: default-scheduler
+  plugins:
+    preFilter:
+      enabled:
+      - name: CapacityScheduling
+    postFilter:
+      enabled:
+      - name: CapacityScheduling
+      disabled:
+      - name: "*"
+    reserve:
+      enabled:
+      - name: CapacityScheduling
+  pluginConfig:
+  - name: CapacityScheduling
+    args:
+      kubeConfigPath: "%s"
+`, configKubeconfig, configKubeconfig)), os.FileMode(0600)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -304,6 +422,7 @@ profiles:
 				"default-scheduler": {
 					"BindPlugin":       {{Name: "DefaultBinder"}},
 					"PreFilterPlugin":  {{Name: "Coscheduling"}},
+					"PostBindPlugin":   {{Name: "Coscheduling"}},
 					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
 					"QueueSortPlugin":  {{Name: "Coscheduling"}},
 					"ReservePlugin":    {{Name: "VolumeBinding"}, {Name: "Coscheduling"}},
@@ -320,11 +439,48 @@ profiles:
 				"default-scheduler": {
 					"BindPlugin":       {{Name: "DefaultBinder"}},
 					"PreFilterPlugin":  {{Name: "Coscheduling"}},
+					"PostBindPlugin":   {{Name: "Coscheduling"}},
 					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
 					"QueueSortPlugin":  {{Name: "Coscheduling"}},
 					"ReservePlugin":    {{Name: "VolumeBinding"}, {Name: "Coscheduling"}},
 					"PermitPlugin":     {{Name: "Coscheduling"}},
 					"PreBindPlugin":    {{Name: "VolumeBinding"}},
+				},
+			},
+		},
+		{
+			name:            "single profile config - Node Resources Allocatable",
+			flags:           []string{"--config", nodeResourcesAllocatableConfigFile},
+			registryOptions: []app.Option{app.WithPlugin(noderesources.AllocatableName, noderesources.NewAllocatable)},
+			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
+				"default-scheduler": {
+					"BindPlugin":       {{Name: "DefaultBinder"}},
+					"FilterPlugin":     defaultPlugins["FilterPlugin"],
+					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
+					"PreBindPlugin":    {{Name: "VolumeBinding"}},
+					"PreFilterPlugin":  defaultPlugins["PreFilterPlugin"],
+					"PreScorePlugin":   defaultPlugins["PreScorePlugin"],
+					"QueueSortPlugin":  defaultPlugins["QueueSortPlugin"],
+					"ReservePlugin":    {{Name: "VolumeBinding"}},
+					"ScorePlugin":      {{Name: "NodeResourcesAllocatable", Weight: 1}},
+				},
+			},
+		},
+		{
+			name:            "single profile config - Node Resources Allocatable with args",
+			flags:           []string{"--config", nodeResourcesAllocatableConfigWithArgsFile},
+			registryOptions: []app.Option{app.WithPlugin(noderesources.AllocatableName, noderesources.NewAllocatable)},
+			wantPlugins: map[string]map[string][]kubeschedulerconfig.Plugin{
+				"default-scheduler": {
+					"BindPlugin":       {{Name: "DefaultBinder"}},
+					"FilterPlugin":     defaultPlugins["FilterPlugin"],
+					"PostFilterPlugin": {{Name: "DefaultPreemption"}},
+					"PreBindPlugin":    {{Name: "VolumeBinding"}},
+					"PreFilterPlugin":  defaultPlugins["PreFilterPlugin"],
+					"PreScorePlugin":   defaultPlugins["PreScorePlugin"],
+					"QueueSortPlugin":  defaultPlugins["QueueSortPlugin"],
+					"ReservePlugin":    {{Name: "VolumeBinding"}},
+					"ScorePlugin":      {{Name: "NodeResourcesAllocatable", Weight: 1}},
 				},
 			},
 		},

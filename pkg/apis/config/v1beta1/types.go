@@ -18,6 +18,7 @@ package v1beta1
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	schedulerconfig "k8s.io/kube-scheduler/config/v1"
 )
 
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
@@ -28,9 +29,47 @@ type CoschedulingArgs struct {
 
 	// PermitWaitingTime is the wait timeout in seconds.
 	PermitWaitingTimeSeconds *int64 `json:"permitWaitingTimeSeconds,omitempty"`
-	// PodGroupGCInterval is the period to run gc of PodGroup in seconds.
-	PodGroupGCIntervalSeconds *int64 `json:"podGroupGCIntervalSeconds,omitempty"`
-	// If the deleted PodGroup stays longer than the PodGroupExpirationTime,
-	// the PodGroup will be deleted from PodGroupInfos.
-	PodGroupExpirationTimeSeconds *int64 `json:"podGroupExpirationTimeSeconds,omitempty"`
+	// DeniedPGExpirationTimeSeconds is the expiration time of the denied podgroup store.
+	DeniedPGExpirationTimeSeconds *int64 `json:"deniedPGExpirationTimeSeconds,omitempty"`
+	// KubeMaster is the url of api-server
+	KubeMaster *string `json:"kubeMaster,omitempty"`
+	// KubeConfigPath for scheduler
+	KubeConfigPath *string `json:"kubeConfigPath,omitempty"`
+}
+
+// ModeType is a type "string".
+type ModeType string
+
+const (
+	// Least is the string "Least".
+	Least ModeType = "Least"
+	// Most is the string "Most".
+	Most ModeType = "Most"
+)
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// NodeResourcesAllocatableArgs holds arguments used to configure NodeResourcesAllocatable plugin.
+type NodeResourcesAllocatableArgs struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// Resources to be considered when scoring.
+	// Allowed weights start from 1.
+	// An example resource set might include "cpu" (millicores) and "memory" (bytes)
+	// with weights of 1<<20 and 1 respectfully. That would mean 1 MiB has equivalent
+	// weight as 1 millicore.
+	Resources []schedulerconfig.ResourceSpec `json:"resources,omitempty"`
+
+	// Whether to prioritize nodes with least or most allocatable resources.
+	Mode ModeType `json:"mode,omitempty"`
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// CapacitySchedulingArgs defines the scheduling parameters for CapacityScheduling plugin.
+type CapacitySchedulingArgs struct {
+	metav1.TypeMeta `json:",inline"`
+
+	// KubeConfigPath is the path of kubeconfig.
+	KubeConfigPath *string `json:"kubeConfigPath,omitempty"`
 }
